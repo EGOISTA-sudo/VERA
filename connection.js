@@ -12,6 +12,26 @@ const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStor
 const state = { status: 'starting', startedAt: Date.now(), sock: null };
 let retries = 0;
 const PAIRING_TIMEOUT_MS = 60 * 1000;
+// Anti-spam: asking WhatsApp for pairing codes too often gets the number rate-limited,
+// after which every code is rejected. So we cap and slow down code requests.
+const MAX_CODES_PER_ROUND = 3;          // expired-unused codes before a long pause
+const MAX_REJECTIONS = 3;               // "pairing rejected" results before giving up
+const REJECT_WAIT_MS = [2, 5, 10].map((m) => m * 60 * 1000);
+const LONG_PAUSE_MS = 10 * 60 * 1000;
+let codesThisRound = 0;
+let rejections = 0;
+
+// WhatsApp needs the number in full international format: digits only, country code first,
+// no leading 0. A local-style number (e.g. 0803... in Nigeria) gives a code the phone rejects
+// with "Couldn't link device", so fix the common mistakes here.
+function normalizeNumber(raw) {
+  let n = String(raw || '').replace(/\D/g, '');
+  if (n.startsWith('00')) n = n.slice(2);                          // 00234... -> 234...
+  if (/^0[789]\d{9}$/.test(n)) n = '234' + n.slice(1);             // 0803xxxxxxx -> 234803xxxxxxx
+  if (/^2340\d{10}$/.test(n)) n = '234' + n.slice(4);              // 2340803xxxxxxx -> 234803xxxxxxx
+  return n;
+}
+const mask = (n) => `${n.slice(0, 3)}${'*'.repeat(Math.max(0, n.length - 7))}${n.slice(-4)}`;
 
 async function start(onMessage) {
   const useDb = db.enabled();
@@ -31,6 +51,7 @@ async function start(onMessage) {
     connectTimeoutMs: 60000,
   });
   state.sock = sock;
+  const wasRegistered = Boolean(auth.creds.registered);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -42,12 +63,18 @@ async function start(onMessage) {
 
     if (qr && !sock.authState.creds.registered && !pairingRequested) {
       pairingRequested = true;
-      if (!config.pairingNumber) {
+      const number = normalizeNumber(config.pairingNumber);
+      if (!number) {
         log.warn('Not linked yet. Add PAIRING_NUMBER (digits, with country code) to Secrets and restart.');
+      } else if (number.length < 10 || number.length > 15) {
+        log.error(`PAIRING_NUMBER looks wrong (${mask(number)}). Use digits only with the country code, e.g. 2348012345678.`);
       } else {
         try {
-          const code = await sock.requestPairingCode(config.pairingNumber);
-          console.log(`\n=== PAIRING CODE: ${String(code).replace(/(.{4})(.+)/, '$1-$2')} ===`);
+          log.info(`Requesting pairing code for ${mask(number)} (this must be the number of the WhatsApp account on the phone you link from)`);
+          codesThisRound++;
+          const code = await sock.requestPairingCode(number);
+          const t = new Date().toISOString().slice(11, 19);
+          console.log(`\n=== PAIRING CODE: ${String(code).replace(/(.{4})(.+)/, '$1-$2')} === (made at ${t} UTC, use it within about a minute)`);
           // A pairing code only lives ~1 minute. If it is not used in time, drop this
           // connection and start a fresh one, which prints a brand-new code.
           pairTimer = setTimeout(() => {
@@ -56,9 +83,9 @@ async function start(onMessage) {
             log.warn('Pairing code expired after 1 minute. Getting a new one...');
             try { sock.end(new Error('pairing-timeout')); } catch {}
           }, PAIRING_TIMEOUT_MS);
-          console.log('(This code is valid for 1 minute. A new one prints automatically after that.)');
           console.log('WhatsApp > Settings > Linked Devices > Link a Device > "Link with phone number instead"\n');
         } catch (e) {
+          pairingRequested = false; // let the next QR event try again
           log.error('Could not get pairing code:', e.message);
         }
       }
@@ -68,6 +95,8 @@ async function start(onMessage) {
     if (connection === 'open') {
       clearTimeout(pairTimer);
       retries = 0;
+      codesThisRound = 0;
+      rejections = 0;
       log.info('WhatsApp connected.');
     }
     if (connection === 'close') {
@@ -75,7 +104,13 @@ async function start(onMessage) {
       if (expired) {
         expired = false;
         retries = 0;
-        setTimeout(() => start(onMessage).catch((e) => log.error('Restart failed:', e.message)), 2000);
+        let wait = 2000;
+        if (codesThisRound >= MAX_CODES_PER_ROUND) {
+          codesThisRound = 0;
+          wait = LONG_PAUSE_MS;
+          log.warn(`${MAX_CODES_PER_ROUND} pairing codes went unused. Pausing ${LONG_PAUSE_MS / 60000} min so WhatsApp does not rate-limit this number. Get ready to enter the next code fast.`);
+        }
+        setTimeout(() => start(onMessage).catch((e) => log.error('Restart failed:', e.message)), wait);
         return;
       }
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -83,8 +118,21 @@ async function start(onMessage) {
         state.status = 'logged-out';
         if (useDb) await db.delPrefix('auth:').catch(() => {});
         else await require('fs').promises.rm(config.authDir, { recursive: true, force: true }).catch(() => {});
-        log.error('Logged out / pairing rejected. Cleared the saved login; a fresh pairing code will be printed in 5s...');
-        setTimeout(() => start(onMessage).catch((e) => log.error('Restart failed:', e.message)), 5000);
+        if (wasRegistered) {
+          // A real linked session was logged out from the phone: clear it and pair again.
+          log.error('Logged out from the phone. Cleared the saved login; a fresh pairing code will be printed in 10s...');
+          setTimeout(() => start(onMessage).catch((e) => log.error('Restart failed:', e.message)), 10000);
+          return;
+        }
+        // Pairing itself was rejected. Do NOT retry every 5 seconds: back off, then stop.
+        if (rejections >= MAX_REJECTIONS) {
+          state.status = 'pairing-failed';
+          log.error(`Pairing was rejected ${MAX_REJECTIONS} times. Stopping so the number is not flagged. Check PAIRING_NUMBER (digits + country code, the number logged into the phone you link from), wait about an hour, then redeploy.`);
+          return;
+        }
+        const wait = REJECT_WAIT_MS[rejections++];
+        log.error(`Pairing rejected (attempt ${rejections}/${MAX_REJECTIONS}). Waiting ${wait / 60000} min before the next code...`);
+        setTimeout(() => start(onMessage).catch((e) => log.error('Restart failed:', e.message)), wait);
         return;
       }
       if (code === DisconnectReason.connectionReplaced) {
